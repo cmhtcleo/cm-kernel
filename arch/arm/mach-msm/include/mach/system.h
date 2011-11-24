@@ -27,5 +27,9 @@ static inline void arch_reset(char mode, const char *cmd)
  */
 extern void (*msm_hw_reset_hook)(void);
 
+#if !defined(CONFIG_MACH_HTCLEO)
 void msm_set_i2c_mux(bool gpio, int *gpio_clk, int *gpio_dat);
+#else
+void msm_set_i2c_mux(bool gpio, int *gpio_clk, int *gpio_dat, int clk_str, int dat_str);
+#endif
 
