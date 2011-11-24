@@ -924,7 +924,7 @@ struct clk msm_clocks_8x50[] = {
 	CLK_PCOM("pcm_clk",	PCM_CLK,	NULL, 0),
 	CLK_PCOM("sdac_clk",	SDAC_CLK,	NULL, OFF),
 #if defined(CONFIG_MACH_HTCLEO)
-	CLK_PCOM("spi_clk",	SPI_CLK,	&NULL, 0),
+	CLK_PCOM("spi_clk",	SPI_CLK,	NULL, 0),
 #else
 	CLK_PCOM("spi_clk",	SPI_CLK,	&msm_device_spi.dev, 0),
 #endif
@@ -958,7 +958,7 @@ struct clk msm_clocks_8x50[] = {
 	CLK_PCOM("usb_hs3_pclk",	USB_HS3_P_CLK,	NULL, OFF),
 	CLK_PCOM("usb_phy_clk",	USB_PHY_CLK,	NULL, 0),
 #ifdef CONFIG_MACH_HTCLEO
-	CLOCK(NULL, 0, NULL, 0),
+	CLOCK(NULL, 0, NULL, 0, 0),
 #endif
 };
 
