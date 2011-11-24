@@ -19,7 +19,7 @@
 #include <mach/board.h>
 
 #define MSM_EBI1_BANK0_BASE     0x11800000
-#define MSM_EBI1_BANK0_SIZE     0x19EC0000 /* 488MB - 0x00040000 RAM CONSOLE*/
+#define MSM_EBI1_BANK0_SIZE     0x1E7C0000 /* 414 MB -  RAM CONSOLE/PMEM*/
 
 /* Don't change that */
 #define MSM_SMI_BASE		0x00000000
@@ -36,10 +36,13 @@
 #define MSM_GPU_PHYS_BASE       0x03300000
 #define MSM_GPU_PHYS_SIZE       0x00500000
 
-#define MSM_PMEM_MDP_BASE	0x2B6C0000
+#define MSM_FB_BASE		0x03800000
+#define MSM_FB_SIZE		0x00300000
+
+//#define MSM_PMEM_MDP_BASE	0x2B6C0000
 #define MSM_PMEM_MDP_SIZE	0x02000000
 
-#define MSM_PMEM_ADSP_BASE	0x2D6C0000
+//#define MSM_PMEM_ADSP_BASE	0x2D6C0000
 #define MSM_PMEM_ADSP_SIZE	0x02900000
 /* Begin EBI region */
 
@@ -166,3 +169,4 @@ int __init htcleo_init_panel(void);
 int htcleo_is_nand_boot(void);
 
 #endif /* __ARCH_ARM_MACH_MSM_BOARD_HTCLEO_H */
+

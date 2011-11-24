@@ -88,21 +88,34 @@ struct ll_struct {
 };
 
 #ifdef CONFIG_SERIAL_MSM_HS
+#ifdef CONFIG_MACH_HTCLEO
+void bcm_msm_hs_request_clock_off(struct uart_port *uport);
+void bcm_msm_hs_request_clock_on(struct uart_port *uport);
+#else
 void msm_hs_request_clock_off(struct uart_port *uport);
 void msm_hs_request_clock_on(struct uart_port *uport);
+#endif
 
 static void __ll_msm_serial_clock_on(struct tty_struct *tty) {
 	struct uart_state *state = tty->driver_data;
 	struct uart_port *port = state->uart_port;
-
+	
+	#ifdef CONFIG_MACH_HTCLEO
+	bcm_msm_hs_request_clock_on(port);
+	#else
 	msm_hs_request_clock_on(port);
+	#endif
 }
 
 static void __ll_msm_serial_clock_request_off(struct tty_struct *tty) {
 	struct uart_state *state = tty->driver_data;
 	struct uart_port *port = state->uart_port;
 
+	#ifdef CONFIG_MACH_HTCLEO
+	bcm_msm_hs_request_clock_off(port);
+	#else
 	msm_hs_request_clock_off(port);
+	#endif
 }
 #else
 static inline void __ll_msm_serial_clock_on(struct tty_struct *tty) {}
