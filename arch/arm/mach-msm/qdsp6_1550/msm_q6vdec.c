@@ -1,4 +1,9 @@
-/* Copyright (c) 2008-2009, Code Aurora Forum. All rights reserved.
+/*
+ * Copyright (c) 2008-2009, Code Aurora Forum. All rights reserved.
+ * Copyright (c) 2009, Google Inc.
+ *
+ * Original authors: Code Aurora Forum
+ * Major cleanup: Dima Zavin <dima@android.com>
  *
  * Redistribution and use in source and binary forms, with or without
  * modification, are permitted provided that the following conditions are met:
@@ -26,916 +31,611 @@
  *
  */
 
-/*
-#define DEBUG_TRACE_VDEC
-#define DEBUG
-*/
+//#define DEBUG 1
 
-#include <linux/cdev.h>
-#include <linux/delay.h>
+#include <linux/device.h>
 #include <linux/file.h>
 #include <linux/fs.h>
+#include <linux/init.h>
 #include <linux/list.h>
 #include <linux/miscdevice.h>
 #include <linux/module.h>
 #include <linux/mutex.h>
-#include <linux/platform_device.h>
 #include <linux/sched.h>
-#include <linux/slab.h>
 #include <linux/spinlock.h>
 #include <linux/uaccess.h>
-#include <linux/wakelock.h>
-
 #include <linux/android_pmem.h>
-#include <linux/msm_q6vdec.h>
+#include <linux/msm_q6venc_1550.h>
+#include <linux/dma-mapping.h> 
+#include <linux/slab.h>
+#include <asm/cacheflush.h> 
 
 #include "dal.h"
 
-#define DALDEVICEID_VDEC_DEVICE		0x02000026
-#define DALDEVICEID_VDEC_PORTNAME	"DSP_DAL_AQ_VID"
-
-#define VDEC_INTERFACE_VERSION		0x00020000
-
-#define MAJOR_MASK			0xFFFF0000
-#define MINOR_MASK			0x0000FFFF
-
-#define VDEC_GET_MAJOR_VERSION(version)	(((version)&MAJOR_MASK)>>16)
-
-#define VDEC_GET_MINOR_VERSION(version)	((version)&MINOR_MASK)
-
-#ifdef DEBUG_TRACE_VDEC
-#define TRACE(fmt,x...)			\
-	do { pr_debug("%s:%d " fmt, __func__, __LINE__, ##x); } while (0)
-#else
-#define TRACE(fmt,x...)		do { } while (0)
-#endif
-
-
-static DEFINE_MUTEX(idlecount_lock);
-static int idlecount;
-static struct wake_lock wakelock;
-static struct wake_lock idlelock;
-
-static void prevent_sleep(void)
-{
-	mutex_lock(&idlecount_lock);
-	if (++idlecount == 1) {
-		wake_lock(&idlelock);
-		wake_lock(&wakelock);
-	}
-	mutex_unlock(&idlecount_lock);
-}
-
-static void allow_sleep(void)
-{
-	mutex_lock(&idlecount_lock);
-	if (--idlecount == 0) {
-		wake_unlock(&idlelock);
-		wake_unlock(&wakelock);
-	}
-	mutex_unlock(&idlecount_lock);
-}
-
+#define DALDEVICEID_VENC_DEVICE		0x0200002D
+#define DALDEVICEID_VENC_PORTNAME	"DSP_DAL_AQ_VID"
 
 enum {
-	VDEC_DALRPC_INITIALIZE = DAL_OP_FIRST_DEVICE_API,
-	VDEC_DALRPC_SETBUFFERS,
-	VDEC_DALRPC_FREEBUFFERS,
-	VDEC_DALRPC_QUEUE,
-	VDEC_DALRPC_SIGEOFSTREAM,
-	VDEC_DALRPC_FLUSH,
-	VDEC_DALRPC_REUSEFRAMEBUFFER,
-	VDEC_DALRPC_GETDECATTRIBUTES,
+	VENC_DALRPC_INITIALIZE = DAL_OP_FIRST_DEVICE_API,
+	VENC_DALRPC_SET_CB_CHANNEL,
+	VENC_DALRPC_ENCODE,
+	VENC_DALRPC_INTRA_REFRESH,
+	VENC_DALRPC_RC_CONFIG,
+	VENC_DALRPC_ENCODE_CONFIG,
+	VENC_DALRPC_STOP,
 };
 
-enum {
-	VDEC_ASYNCMSG_DECODE_DONE = 0xdec0de00,
-	VDEC_ASYNCMSG_REUSE_FRAME,
+struct callback_event_data {
+	u32				data_notify_event;
+	u32				enc_cb_handle;
+	u32				empty_input_buffer_event;
 };
 
-struct vdec_init_cfg {
-	u32			decode_done_evt;
-	u32			reuse_frame_evt;
-	struct vdec_config	cfg;
+struct buf_info {
+	unsigned long			paddr;
+	unsigned long			vaddr;
+	struct file			*file;
+	struct venc_buf			venc_buf;
 };
 
-struct vdec_buffer_status {
-	u32			data;
-	u32			status;
+#define VENC_MAX_BUF_NUM		15
+#define RLC_MAX_BUF_NUM			2
+#define BITS_PER_PIXEL			12
+#define PIXELS_PER_MACROBLOCK		16
+
+#define VENC_CB_EVENT_ID		0xd0e4c0de
+
+struct q6venc_dev {
+	struct dal_client		*venc;
+	struct callback_event_data	cb_ev_data;
+	bool				stop_encode;
+	struct buf_info			rlc_bufs[RLC_MAX_BUF_NUM];
+	unsigned int			rlc_buf_index;
+	unsigned int			rlc_buf_len;
+	unsigned int                    enc_buf_size;
+	struct buf_info			enc_bufs[VENC_MAX_BUF_NUM];
+	unsigned int			num_enc_bufs;
+	wait_queue_head_t		encode_wq;
+
+	/* protects all state in q6venc_dev except for cb stuff below */
+	struct mutex			lock;
+
+	/* protects encode_done and done_frame inside the callback */
+	spinlock_t			done_lock;
+	struct frame_type		done_frame;
+	bool				encode_done;
 };
 
-#define VDEC_MSG_MAX		128
-
-struct vdec_msg_list {
-	struct list_head	list;
-	struct vdec_msg		vdec_msg;
-};
-
-struct vdec_mem_info {
-	u32			buf_type;
-	u32			id;
-	unsigned long		phys_addr;
-	unsigned long		len;
-	struct file		*file;
-};
-
-struct vdec_mem_list {
-	struct list_head	list;
-	struct vdec_mem_info	mem;
-};
-
-struct vdec_data {
-	struct dal_client	*vdec_handle;
-	struct list_head	vdec_msg_list_head;
-	struct list_head	vdec_msg_list_free;
-	wait_queue_head_t	vdec_msg_evt;
-	spinlock_t		vdec_list_lock;
-	struct list_head	vdec_mem_list_head;
-	spinlock_t		vdec_mem_list_lock;
-	int			mem_initialized;
-	int			running;
-	int			close_decode;
-};
-
-static struct class *driver_class;
-static dev_t vdec_device_no;
-static struct cdev vdec_cdev;
-static int ref_cnt;
-static DEFINE_MUTEX(vdec_ref_lock);
-
-static inline int vdec_check_version(u32 client, u32 server)
+static int get_buf_info(struct buf_info *buf_info, struct venc_buf *venc_buf)
 {
-	int ret = -EINVAL;
-	if ((VDEC_GET_MAJOR_VERSION(client) == VDEC_GET_MAJOR_VERSION(server))
-	    && (VDEC_GET_MINOR_VERSION(client) <=
-		VDEC_GET_MINOR_VERSION(server)))
-		ret = 0;
-	return ret;
-}
+	unsigned long len;
+	unsigned long vaddr;
+	unsigned long paddr;
+	struct file *file;
+	int ret;
 
-static int vdec_get_msg(struct vdec_data *vd, void *msg)
-{
-	struct vdec_msg_list *l;
-	unsigned long flags;
-	int ret = 0;
-
-	if (!vd->running)
-		return -EPERM;
-
-	spin_lock_irqsave(&vd->vdec_list_lock, flags);
-	list_for_each_entry_reverse(l, &vd->vdec_msg_list_head, list) {
-		if (copy_to_user(msg, &l->vdec_msg, sizeof(struct vdec_msg)))
-			pr_err("vdec_get_msg failed to copy_to_user!\n");
-		if (l->vdec_msg.id == VDEC_MSG_REUSEINPUTBUFFER)
-			TRACE("reuse_input_buffer %d\n", l->vdec_msg.buf_id);
-		else if (l->vdec_msg.id == VDEC_MSG_FRAMEDONE)
-			TRACE("frame_done (stat=%d)\n",
-			      l->vdec_msg.vfr_info.status);
-		else
-			TRACE("unknown msg (msgid=%d)\n", l->vdec_msg.id);
-		list_del(&l->list);
-		list_add(&l->list, &vd->vdec_msg_list_free);
-		ret = 1;
-		break;
-	}
-	spin_unlock_irqrestore(&vd->vdec_list_lock, flags);
-
-	if (vd->close_decode)
-		ret = 1;
-
-	return ret;
-}
-
-static void vdec_put_msg(struct vdec_data *vd, struct vdec_msg *msg)
-{
-	struct vdec_msg_list *l;
-	unsigned long flags;
-	int found = 0;
-
-	spin_lock_irqsave(&vd->vdec_list_lock, flags);
-	list_for_each_entry(l, &vd->vdec_msg_list_free, list) {
-		memcpy(&l->vdec_msg, msg, sizeof(struct vdec_msg));
-		list_del(&l->list);
-		list_add(&l->list, &vd->vdec_msg_list_head);
-		found = 1;
-		break;
-	}
-	spin_unlock_irqrestore(&vd->vdec_list_lock, flags);
-
-	if (found)
-		wake_up(&vd->vdec_msg_evt);
-	else
-		pr_err("vdec_put_msg can't find free list!\n");
-}
-
-static struct vdec_mem_list *vdec_get_mem_from_list(struct vdec_data *vd,
-						    u32 pmem_id, u32 buf_type)
-{
-	struct vdec_mem_list *l;
-	unsigned long flags;
-	int found = 0;
-
-	spin_lock_irqsave(&vd->vdec_mem_list_lock, flags);
-	list_for_each_entry(l, &vd->vdec_mem_list_head, list) {
-		if (l->mem.buf_type == buf_type && l->mem.id == pmem_id) {
-			found = 1;
-			break;
-		}
-	}
-	spin_unlock_irqrestore(&vd->vdec_mem_list_lock, flags);
-
-	if (found)
-		return l;
-	else
-		return NULL;
-
-}
-
-static int vdec_initialize(struct vdec_data *vd, void *argp)
-{
-	struct vdec_config_sps vdec_cfg_sps;
-	struct vdec_init_cfg vi_cfg;
-	struct vdec_buf_req vdec_buf_req;
-	struct u8 *header;
-	int ret = 0;
-
-	ret = copy_from_user(&vdec_cfg_sps,
-			     &((struct vdec_init *)argp)->sps_cfg,
-			     sizeof(vdec_cfg_sps));
-
+	ret = get_pmem_file(venc_buf->fd, &paddr, &vaddr, &len, &file);
 	if (ret) {
-		pr_err("%s: copy_from_user failed\n", __func__);
+		pr_err("%s: get_pmem_file failed for fd=%d offset=%ld\n",
+		       __func__, venc_buf->fd, venc_buf->offset);
 		return ret;
-	}
-
-	vi_cfg.decode_done_evt = VDEC_ASYNCMSG_DECODE_DONE;
-	vi_cfg.reuse_frame_evt = VDEC_ASYNCMSG_REUSE_FRAME;
-	memcpy(&vi_cfg.cfg, &vdec_cfg_sps.cfg, sizeof(struct vdec_config));
-
-	header = kmalloc(vdec_cfg_sps.seq.len, GFP_KERNEL);
-	if (!header) {
-		pr_err("%s: kmalloc failed\n", __func__);
-		return -ENOMEM;
-	}
-
-	ret = copy_from_user(header,
-			     ((struct vdec_init *)argp)->sps_cfg.seq.header,
-			     vdec_cfg_sps.seq.len);
-
-	if (ret) {
-		pr_err("%s: copy_from_user failed\n", __func__);
-		kfree(header);
-		return ret;
-	}
-
-	TRACE("vi_cfg: handle=%p fourcc=0x%x w=%d h=%d order=%d notify_en=%d "
-	      "vc1_rb=%d h264_sd=%d h264_nls=%d pp_flag=%d fruc_en=%d\n",
-	      vd->vdec_handle, vi_cfg.cfg.fourcc, vi_cfg.cfg.width,
-	      vi_cfg.cfg.height, vi_cfg.cfg.order, vi_cfg.cfg.notify_enable,
-	      vi_cfg.cfg.vc1_rowbase, vi_cfg.cfg.h264_startcode_detect,
-	      vi_cfg.cfg.h264_nal_len_size, vi_cfg.cfg.postproc_flag,
-	      vi_cfg.cfg.fruc_enable);
-	ret = dal_call_f13(vd->vdec_handle, VDEC_DALRPC_INITIALIZE,
-			   &vi_cfg, sizeof(vi_cfg),
-			   header, vdec_cfg_sps.seq.len,
-			   &vdec_buf_req, sizeof(vdec_buf_req));
-
-	kfree(header);
-
-	if (ret)
-		pr_err("%s: remote function failed (%d)\n", __func__, ret);
-	else
-		ret = copy_to_user(((struct vdec_init *)argp)->buf_req,
-				   &vdec_buf_req, sizeof(vdec_buf_req));
-
-	vd->close_decode = 0;
-	return ret;
-}
-
-static int vdec_setbuffers(struct vdec_data *vd, void *argp)
-{
-	struct vdec_buffer vmem;
-	struct vdec_mem_list *l;
-	unsigned long vstart;
-	unsigned long flags;
-	struct {
-		uint32_t size;
-		struct vdec_buf_info buf;
-	} rpc;
-	uint32_t res;
-
-	int ret = 0;
-
-	vd->mem_initialized = 0;
-
-	ret = copy_from_user(&vmem, argp, sizeof(vmem));
-	if (ret) {
-		pr_err("%s: copy_from_user failed\n", __func__);
-		return ret;
-	}
-
-	l = kzalloc(sizeof(struct vdec_mem_list), GFP_KERNEL);
-	if (!l) {
-		pr_err("%s: kzalloc failed!\n", __func__);
-		return -ENOMEM;
-	}
-
-	l->mem.id = vmem.pmem_id;
-	l->mem.buf_type = vmem.buf.buf_type;
-
-	ret = get_pmem_file(l->mem.id, &l->mem.phys_addr, &vstart,
-			    &l->mem.len, &l->mem.file);
-	if (ret) {
-		pr_err("%s: get_pmem_fd failed\n", __func__);
-		goto err_get_pmem_file;
-	}
-
-	TRACE("pmem_id=%d (phys=0x%08lx len=0x%lx) buftype=%d num_buf=%d "
-	      "islast=%d src_id=%d offset=0x%08x size=0x%x\n",
-	      vmem.pmem_id, l->mem.phys_addr, l->mem.len,
-	      vmem.buf.buf_type, vmem.buf.num_buf, vmem.buf.islast,
-	      vmem.buf.region.src_id, vmem.buf.region.offset,
-	      vmem.buf.region.size);
-
-	/* input buffers */
-	if ((vmem.buf.region.offset + vmem.buf.region.size) > l->mem.len) {
-		pr_err("%s: invalid input buffer offset!\n", __func__);
-		ret = -EINVAL;
-		goto err_bad_offset;
-
-	}
-	vmem.buf.region.offset += l->mem.phys_addr;
-
-	rpc.size = sizeof(vmem.buf);
-	memcpy(&rpc.buf, &vmem.buf, sizeof(struct vdec_buf_info));
-
-
-	ret = dal_call(vd->vdec_handle, VDEC_DALRPC_SETBUFFERS, 5,
-		       &rpc, sizeof(rpc), &res, sizeof(res));
-
-	if (ret < 4) {
-		pr_err("%s: remote function failed (%d)\n", __func__, ret);
-		ret = -EIO;
-		goto err_dal_call;
-	}
-
-	spin_lock_irqsave(&vd->vdec_mem_list_lock, flags);
-	list_add(&l->list, &vd->vdec_mem_list_head);
-	spin_unlock_irqrestore(&vd->vdec_mem_list_lock, flags);
-
-	vd->mem_initialized = 1;
-	return ret;
-
-err_dal_call:
-err_bad_offset:
-	put_pmem_file(l->mem.file);
-err_get_pmem_file:
-	kfree(l);
-	return ret;
-}
-
-static int vdec_queue(struct vdec_data *vd, void *argp)
-{
-	struct {
-		uint32_t size;
-		struct vdec_input_buf_info buf_info;
-		uint32_t osize;
-	} rpc;
-	struct vdec_mem_list *l;
-	struct {
-		uint32_t result;
-		uint32_t size;
-		struct vdec_queue_status status;
-	} rpc_res;
-
-	u32 pmem_id;
-	int ret = 0;
-
-	if (!vd->mem_initialized) {
-		pr_err("%s: memory is not being initialized!\n", __func__);
-		return -EPERM;
-	}
-
-	ret = copy_from_user(&rpc.buf_info,
-			     &((struct vdec_input_buf *)argp)->buffer,
-			     sizeof(rpc.buf_info));
-	if (ret) {
-		pr_err("%s: copy_from_user failed\n", __func__);
-		return ret;
-	}
-
-	ret = copy_from_user(&pmem_id,
-			     &((struct vdec_input_buf *)argp)->pmem_id,
-			     sizeof(u32));
-	if (ret) {
-		pr_err("%s: copy_from_user failed\n", __func__);
-		return ret;
-	}
-
-	l = vdec_get_mem_from_list(vd, pmem_id, VDEC_BUFFER_TYPE_INPUT);
-
-	if (NULL == l) {
-		pr_err("%s: not able to find the buffer from list\n", __func__);
-		return -EPERM;
-	}
-
-	if ((rpc.buf_info.size + rpc.buf_info.offset) >= l->mem.len) {
-		pr_err("%s: invalid queue buffer offset!\n", __func__);
+	} else if (venc_buf->offset >= len) {
+		/* XXX: we really should check venc_buf->size too, but userspace
+		 * sometimes leaves this uninitialized (in encode ioctl) */
+		pr_err("%s: invalid offset/size (%ld + %ld > %ld) for fd=%d\n",
+		       __func__, venc_buf->offset, venc_buf->size, len,
+		       venc_buf->fd);
+		put_pmem_file(file);
 		return -EINVAL;
 	}
 
-	rpc.buf_info.offset += l->mem.phys_addr;
-	rpc.size = sizeof(struct vdec_input_buf_info);
-	rpc.osize = sizeof(struct vdec_queue_status);
-
-	ret = dal_call(vd->vdec_handle, VDEC_DALRPC_QUEUE, 8,
-		       &rpc, sizeof(rpc), &rpc_res, sizeof(rpc_res));
-	if (ret < 4) {
-		pr_err("%s: remote function failed (%d)\n", __func__, ret);
-		ret = -EIO;
-	}
-	return ret;
+	buf_info->file = file;
+	buf_info->paddr = paddr + venc_buf->offset;
+	buf_info->vaddr = vaddr;
+	memcpy(&buf_info->venc_buf, venc_buf, sizeof(struct venc_buf));
+	return 0;
 }
 
-static int vdec_reuse_framebuffer(struct vdec_data *vd, void *argp)
+static void put_buf_info(struct buf_info *buf_info)
 {
-	u32 buf_id;
-	int ret = 0;
-
-	ret = copy_from_user(&buf_id, argp, sizeof(buf_id));
-	if (ret) {
-		pr_err("%s: copy_from_user failed\n", __func__);
-		return ret;
-	}
-
-	ret = dal_call_f0(vd->vdec_handle, VDEC_DALRPC_REUSEFRAMEBUFFER,
-			  buf_id);
-	if (ret)
-		pr_err("%s: remote function failed (%d)\n", __func__, ret);
-
-	return ret;
+	if (!buf_info || !buf_info->file)
+		return;
+	put_pmem_file(buf_info->file);
+	buf_info->file = NULL;
 }
 
-static int vdec_flush(struct vdec_data *vd, void *argp)
+static void q6venc_callback(void *context, void *data, uint32_t len)
 {
-	u32 flush_type;
-	int ret = 0;
-
-	ret = copy_from_user(&flush_type, argp, sizeof(flush_type));
-	if (ret) {
-		pr_err("%s: copy_from_user failed\n", __func__);
-		return ret;
-	}
-
-	TRACE("flush_type=%d\n", flush_type);
-	ret = dal_call_f0(vd->vdec_handle, VDEC_DALRPC_FLUSH, flush_type);
-	if (ret) {
-		pr_err("%s: remote function failed (%d)\n", __func__, ret);
-		return ret;
-	}
-
-	return ret;
-}
-
-static int vdec_close(struct vdec_data *vd, void *argp)
-{
-	struct vdec_mem_list *l;
-	int ret = 0;
-
-	pr_info("q6vdec_close()\n");
-	vd->close_decode = 1;
-	wake_up(&vd->vdec_msg_evt);
-	ret = dal_call_f0(vd->vdec_handle, DAL_OP_CLOSE, 0);
-	if (ret)
-		pr_err("%s: failed to close daldevice (%d)\n", __func__, ret);
-
-	if (vd->mem_initialized) {
-		list_for_each_entry(l, &vd->vdec_mem_list_head, list)
-		    put_pmem_file(l->mem.file);
-	}
-
-	return ret;
-}
-static int vdec_getdecattributes(struct vdec_data *vd, void *argp)
-{
-	struct {
-		uint32_t status;
-		uint32_t size;
-		struct vdec_dec_attributes dec_attr;
-	} rpc;
-	uint32_t inp;
-	int ret = 0;
-	inp = sizeof(struct vdec_dec_attributes);
-
-	ret = dal_call(vd->vdec_handle, VDEC_DALRPC_GETDECATTRIBUTES, 9,
-		       &inp, sizeof(inp), &rpc, sizeof(rpc));
-	if (ret < 4 || rpc.size != sizeof(struct vdec_dec_attributes)) {
-		pr_err("%s: remote function failed (%d)\n", __func__, ret);
-		ret = -EIO;
-	} else
-		ret =
-		    copy_to_user(((struct vdec_dec_attributes *)argp),
-				 &rpc.dec_attr, sizeof(rpc.dec_attr));
-	return ret;
-}
-
-static int vdec_freebuffers(struct vdec_data *vd, void *argp)
-{
-	struct vdec_buffer vmem;
-	struct vdec_mem_list *l;
-	struct {
-		uint32_t size;
-		struct vdec_buf_info buf;
-	} rpc;
-	uint32_t res;
-
-	int ret = 0;
-
-	if (!vd->mem_initialized) {
-		pr_err("%s: memory is not being initialized!\n", __func__);
-		return -EPERM;
-	}
-
-	ret = copy_from_user(&vmem, argp, sizeof(vmem));
-	if (ret) {
-		pr_err("%s: copy_from_user failed\n", __func__);
-		return ret;
-	}
-
-	l = vdec_get_mem_from_list(vd, vmem.pmem_id, vmem.buf.buf_type);
-
-	if (NULL == l) {
-		pr_err("%s: not able to find the buffer from list\n", __func__);
-		return -EPERM;
-	}
-
-	/* input buffers */
-	if ((vmem.buf.region.offset + vmem.buf.region.size) > l->mem.len) {
-		pr_err("%s: invalid input buffer offset!\n", __func__);
-		return -EINVAL;
-
-	}
-	vmem.buf.region.offset += l->mem.phys_addr;
-
-	rpc.size = sizeof(vmem.buf);
-	memcpy(&rpc.buf, &vmem.buf, sizeof(struct vdec_buf_info));
-
-	ret = dal_call(vd->vdec_handle, VDEC_DALRPC_FREEBUFFERS, 5,
-		       &rpc, sizeof(rpc), &res, sizeof(res));
-	if (ret < 4) {
-		pr_err("%s: remote function failed (%d)\n", __func__, ret);
-	}
-
-	return ret;
-}
-static long vdec_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
-{
-	struct vdec_data *vd = file->private_data;
-	void __user *argp = (void __user *)arg;
-	int ret = 0;
-
-	if (!vd->running)
-		return -EPERM;
-
-	switch (cmd) {
-	case VDEC_IOCTL_INITIALIZE:
-		ret = vdec_initialize(vd, argp);
-		break;
-
-	case VDEC_IOCTL_SETBUFFERS:
-		ret = vdec_setbuffers(vd, argp);
-		break;
-
-	case VDEC_IOCTL_QUEUE:
-		TRACE("VDEC_IOCTL_QUEUE (pid=%d tid=%d)\n",
-		      current->group_leader->pid, current->pid);
-		ret = vdec_queue(vd, argp);
-		break;
-
-	case VDEC_IOCTL_REUSEFRAMEBUFFER:
-		TRACE("VDEC_IOCTL_REUSEFRAMEBUFFER (pid=%d tid=%d)\n",
-		      current->group_leader->pid, current->pid);
-		ret = vdec_reuse_framebuffer(vd, argp);
-		break;
-
-	case VDEC_IOCTL_FLUSH:
-		ret = vdec_flush(vd, argp);
-		break;
-
-	case VDEC_IOCTL_EOS:
-		TRACE("VDEC_IOCTL_EOS (pid=%d tid=%d)\n",
-		      current->group_leader->pid, current->pid);
-		ret = dal_call_f0(vd->vdec_handle, VDEC_DALRPC_SIGEOFSTREAM, 0);
-		if (ret)
-			pr_err("%s: remote function failed (%d)\n",
-			       __func__, ret);
-		break;
-
-	case VDEC_IOCTL_GETMSG:
-		TRACE("VDEC_IOCTL_GETMSG (pid=%d tid=%d)\n",
-		      current->group_leader->pid, current->pid);
-		wait_event_interruptible(vd->vdec_msg_evt,
-					 vdec_get_msg(vd, argp));
-
-		if (vd->close_decode)
-			ret = -EINTR;
-		break;
-
-	case VDEC_IOCTL_CLOSE:
-		ret = vdec_close(vd, argp);
-		break;
-
-	case VDEC_IOCTL_GETDECATTRIBUTES:
-		TRACE("VDEC_IOCTL_GETDECATTRIBUTES (pid=%d tid=%d)\n",
-		      current->group_leader->pid, current->pid);
-		ret = vdec_getdecattributes(vd, argp);
-
-		if (ret)
-			pr_err("%s: remote function failed (%d)\n",
-			       __func__, ret);
-		break;
-
-	case VDEC_IOCTL_FREEBUFFERS:
-		TRACE("VDEC_IOCTL_FREEBUFFERS (pid=%d tid=%d)\n",
-		      current->group_leader->pid, current->pid);
-		ret = vdec_freebuffers(vd, argp);
-
-		if (ret)
-			pr_err("%s: remote function failed (%d)\n",
-			       __func__, ret);
-		break;
-
-	default:
-		pr_err("%s: invalid ioctl!\n", __func__);
-		ret = -EINVAL;
-		break;
-	}
-
-	TRACE("ioctl done (pid=%d tid=%d)\n",
-	      current->group_leader->pid, current->pid);
-
-	return ret;
-}
-
-static void vdec_dcdone_handler(struct vdec_data *vd, void *frame,
-				uint32_t frame_size)
-{
-	struct vdec_msg msg;
-	struct vdec_mem_list *l;
+	struct q6venc_dev *q6venc = context;
+	struct q6_frame_type *q6frame = data;
+	struct buf_info *rlc_buf;
 	unsigned long flags;
-	int found = 0;
+	int i;
 
-	if (frame_size != sizeof(struct vdec_frame_info)) {
-		pr_warning("%s: msg size mismatch %d != %d\n", __func__,
-			   frame_size, sizeof(struct vdec_frame_info));
-		return;
+	pr_debug("%s \n", __func__);
+
+	spin_lock_irqsave(&q6venc->done_lock, flags);
+	q6venc->encode_done = true;
+	for (i = 0; i < RLC_MAX_BUF_NUM; ++i) {
+		rlc_buf = &q6venc->rlc_bufs[i];
+		if (rlc_buf->paddr == q6frame->frame_addr)
+			goto frame_found;
 	}
 
-	memcpy(&msg.vfr_info, (struct vdec_frame_info *)frame,
-	       sizeof(struct vdec_frame_info));
+	pr_err("%s: got incorrect phy address 0x%08x from q6 \n", __func__,
+	       q6frame->frame_addr);
+	q6venc->done_frame.q6_frame_type.frame_len = 0;
+	wake_up_interruptible(&q6venc->encode_wq);
+	goto done;
 
-	if (msg.vfr_info.status == VDEC_FRAME_DECODE_OK) {
-		spin_lock_irqsave(&vd->vdec_mem_list_lock, flags);
-		list_for_each_entry(l, &vd->vdec_mem_list_head, list) {
-			if ((l->mem.buf_type == VDEC_BUFFER_TYPE_OUTPUT) &&
-			    (msg.vfr_info.offset >= l->mem.phys_addr) &&
-			    (msg.vfr_info.offset <
-			     (l->mem.phys_addr + l->mem.len))) {
-				found = 1;
-				msg.vfr_info.offset -= l->mem.phys_addr;
-				msg.vfr_info.data2 = l->mem.id;
-				break;
-			}
-		}
-		spin_unlock_irqrestore(&vd->vdec_mem_list_lock, flags);
-	}
+frame_found:
+	memcpy(&q6venc->done_frame.frame_addr, &rlc_buf->venc_buf,
+	       sizeof(struct venc_buf));
+	memcpy(&q6venc->done_frame.q6_frame_type, q6frame,
+	       sizeof(struct q6_frame_type));
 
-	if (found || (msg.vfr_info.status != VDEC_FRAME_DECODE_OK)) {
-		msg.id = VDEC_MSG_FRAMEDONE;
-		vdec_put_msg(vd, &msg);
-	} else {
-		pr_err("%s: invalid phys addr = 0x%x\n",
-		       __func__, msg.vfr_info.offset);
-	}
+	dmac_unmap_area((void *)q6venc->rlc_bufs[i].vaddr, q6venc->rlc_buf_len, DMA_TO_DEVICE);
+	outer_inv_range(__pa((u32) (void *)q6venc->rlc_bufs[i].vaddr),
+			__pa((u32) (void *)(q6venc->rlc_bufs[i].vaddr + q6venc->rlc_buf_len))); 
+				 
+	wake_up_interruptible(&q6venc->encode_wq);
 
-}
-
-static void vdec_reuseibuf_handler(struct vdec_data *vd, void *bufstat,
-				   uint32_t bufstat_size)
-{
-	struct vdec_buffer_status *vdec_bufstat;
-	struct vdec_msg msg;
-
-	/* TODO: how do we signal the client? If they are waiting on a
-	 * message in an ioctl, they may block forever */
-	if (bufstat_size != sizeof(struct vdec_buffer_status)) {
-		pr_warning("%s: msg size mismatch %d != %d\n", __func__,
-			   bufstat_size, sizeof(struct vdec_buffer_status));
-		return;
-	}
-	vdec_bufstat = (struct vdec_buffer_status *)bufstat;
-	msg.id = VDEC_MSG_REUSEINPUTBUFFER;
-	msg.buf_id = vdec_bufstat->data;
-	vdec_put_msg(vd, &msg);
+done:
+	spin_unlock_irqrestore(&q6venc->done_lock, flags);
 }
 
 static void callback(void *data, int len, void *cookie)
 {
-	struct vdec_data *vd = (struct vdec_data *)cookie;
+	struct q6venc_dev *ve = (struct q6venc_dev *)cookie;
 	uint32_t *tmp = (uint32_t *) data;
 
-	if (!vd->mem_initialized) {
-		pr_err("%s:memory not initialize but callback called!\n",
-		       __func__);
-		return;
-	}
-
-	TRACE("vdec_async: tmp=0x%08x 0x%08x 0x%08x\n", tmp[0], tmp[1], tmp[2]);
-	switch (tmp[0]) {
-	case VDEC_ASYNCMSG_DECODE_DONE:
-		vdec_dcdone_handler(vd, &tmp[3], tmp[2]);
-		break;
-	case VDEC_ASYNCMSG_REUSE_FRAME:
-		vdec_reuseibuf_handler(vd, &tmp[3], tmp[2]);
-		break;
-	default:
-		pr_err("%s: Unknown async message from DSP id=0x%08x sz=%u\n",
-		       __func__, tmp[0], tmp[2]);
-	}
+	if (tmp[0] == VENC_CB_EVENT_ID)
+		q6venc_callback(ve, &tmp[3], tmp[2]);
+	else
+		pr_err("%s: Unknown callback received for %p\n", __func__, ve);
 }
-static int vdec_open(struct inode *inode, struct file *file)
-{
-	int ret;
-	int i;
-	struct vdec_msg_list *l;
-	struct vdec_data *vd;
 
-	pr_info("q6vdec_open()\n");
-	mutex_lock(&vdec_ref_lock);
-	if (ref_cnt > 0) {
-		pr_err("%s: Instance alredy running\n", __func__);
-		mutex_unlock(&vdec_ref_lock);
+static int q6venc_open(struct inode *inode, struct file *file)
+{
+	struct q6venc_dev *q6venc;
+	int err;
+
+	q6venc = kzalloc(sizeof(struct q6venc_dev), GFP_KERNEL);
+	if (!q6venc) {
+		pr_err("%s: Unable to allocate memory for q6venc_dev\n",
+		       __func__);
 		return -ENOMEM;
 	}
-	ref_cnt++;
-	mutex_unlock(&vdec_ref_lock);
-	vd = kmalloc(sizeof(struct vdec_data), GFP_KERNEL);
-	if (!vd) {
-		pr_err("%s: kmalloc failed\n", __func__);
-		ret = -ENOMEM;
-		goto vdec_open_err_handle_vd;
-	}
-	file->private_data = vd;
 
-	vd->mem_initialized = 0;
-	INIT_LIST_HEAD(&vd->vdec_msg_list_head);
-	INIT_LIST_HEAD(&vd->vdec_msg_list_free);
-	INIT_LIST_HEAD(&vd->vdec_mem_list_head);
-	init_waitqueue_head(&vd->vdec_msg_evt);
+	file->private_data = q6venc;
 
-	spin_lock_init(&vd->vdec_list_lock);
-	spin_lock_init(&vd->vdec_mem_list_lock);
-	for (i = 0; i < VDEC_MSG_MAX; i++) {
-		l = kzalloc(sizeof(struct vdec_msg_list), GFP_KERNEL);
-		if (!l) {
-			pr_err("%s: kzalloc failed!\n", __func__);
-			ret = -ENOMEM;
-			goto vdec_open_err_handle_list;
-		}
-		list_add(&l->list, &vd->vdec_msg_list_free);
+	init_waitqueue_head(&q6venc->encode_wq);
+	mutex_init(&q6venc->lock);
+	spin_lock_init(&q6venc->done_lock);
+
+	q6venc->venc = dal_attach(DALDEVICEID_VENC_DEVICE,
+				  DALDEVICEID_VENC_PORTNAME,
+				  callback, q6venc);
+	if (!q6venc->venc) {
+		pr_err("%s: dal_attach failed\n", __func__);
+		err = -EIO;
+		goto err_dal_attach;
 	}
 
-	vd->vdec_handle = dal_attach(DALDEVICEID_VDEC_DEVICE,
-				     DALDEVICEID_VDEC_PORTNAME,
-				     callback, vd);
-
-	if (!vd->vdec_handle) {
-		pr_err("%s: failed to attach \n", __func__);
-		ret = -EIO;
-		goto vdec_open_err_handle_list;
+	q6venc->cb_ev_data.enc_cb_handle = VENC_CB_EVENT_ID;
+	err = dal_call_f5(q6venc->venc, VENC_DALRPC_SET_CB_CHANNEL,
+			  &q6venc->cb_ev_data, sizeof(q6venc->cb_ev_data));
+	if (err) {
+		pr_err("%s: set_cb_channgel failed\n", __func__);
+		goto err_dal_call_set_cb;
 	}
 
-	vd->running = 1;
-	prevent_sleep();
+	pr_info("%s() handle=%p enc_cb=%08x\n", __func__, q6venc->venc,
+		q6venc->cb_ev_data.enc_cb_handle);
+
 	return 0;
 
-vdec_open_err_handle_list:
+err_dal_call_set_cb:
+	dal_detach(q6venc->venc);
+err_dal_attach:
+	file->private_data = NULL;
+	mutex_destroy(&q6venc->lock);
+	kfree(q6venc);
+	return err;
+}
+
+static int q6venc_release(struct inode *inode, struct file *file)
+{
+	struct q6venc_dev *q6venc;
+	int id, err;
+
+	q6venc = file->private_data;
+	file->private_data = NULL;
+
+	pr_info("q6venc_close() handle=%p\n", q6venc->venc);
+	for (id = 0; id < q6venc->num_enc_bufs; id++)
+		put_buf_info(&q6venc->enc_bufs[id]);
+	put_buf_info(&q6venc->rlc_bufs[0]);
+	put_buf_info(&q6venc->rlc_bufs[1]);
+
+	if(!q6venc->stop_encode)
 	{
-		struct vdec_msg_list *l, *n;
-		list_for_each_entry_safe(l, n, &vd->vdec_msg_list_free, list) {
-			list_del(&l->list);
-			kfree(l);
-		}
+		err = dal_call_f0(q6venc->venc, VENC_DALRPC_STOP, 1);
+		if (err)
+			pr_err("%s: dal_rpc STOP call failed\n", __func__);
+		q6venc->stop_encode = true;
 	}
-vdec_open_err_handle_vd:
-	kfree(vd);
+
+	dal_detach(q6venc->venc);
+	mutex_destroy(&q6venc->lock);
+	kfree(q6venc);
+	return 0;
+}
+
+static int q6_config_encode(struct q6venc_dev *q6venc, uint32_t type,
+			    struct init_config *init_config)
+{
+	struct q6_init_config *q6_init_config = &init_config->q6_init_config;
+	int ret;
+	int i;
+
+	mutex_lock(&q6venc->lock);
+
+	if (q6venc->num_enc_bufs != 0) {
+		pr_err("%s: multiple sessions not supported\n", __func__);
+		ret = -EBUSY;
+		goto err_busy;
+	}
+
+	ret = get_buf_info(&q6venc->enc_bufs[0], &init_config->ref_frame_buf1);
+	if (ret) {
+		pr_err("%s: can't get ref_frame_buf1\n", __func__);
+		goto err_get_ref_frame_buf1;
+	}
+
+	ret = get_buf_info(&q6venc->enc_bufs[1], &init_config->ref_frame_buf2);
+	if (ret) {
+		pr_err("%s: can't get ref_frame_buf2\n", __func__);
+		goto err_get_ref_frame_buf2;
+	}
+
+	ret = get_buf_info(&q6venc->rlc_bufs[0], &init_config->rlc_buf1);
+	if (ret) {
+		pr_err("%s: can't get rlc_buf1\n", __func__);
+		goto err_get_rlc_buf1;
+	}
+
+	ret = get_buf_info(&q6venc->rlc_bufs[1], &init_config->rlc_buf2);
+	if (ret) {
+		pr_err("%s: can't get rlc_buf2\n", __func__);
+		goto err_get_rlc_buf2;
+	}
+	q6venc->rlc_buf_len = 2 * q6_init_config->rlc_buf_length;
+	q6venc->num_enc_bufs = 2;
+
+	q6venc->enc_buf_size =
+		(q6_init_config->enc_frame_width_inmb * PIXELS_PER_MACROBLOCK) *
+		(q6_init_config->enc_frame_height_inmb * PIXELS_PER_MACROBLOCK) *
+		BITS_PER_PIXEL / 8;
+
+	q6_init_config->ref_frame_buf1_phy = q6venc->enc_bufs[0].paddr;
+	q6_init_config->ref_frame_buf2_phy = q6venc->enc_bufs[1].paddr;
+	q6_init_config->rlc_buf1_phy = q6venc->rlc_bufs[0].paddr;
+	q6_init_config->rlc_buf2_phy = q6venc->rlc_bufs[1].paddr;
+
+	// The DSP may use the rlc_bufs during initialization,
+	for (i=0; i<RLC_MAX_BUF_NUM; i++)
+	{
+		dmac_unmap_area((void *)q6venc->rlc_bufs[i].vaddr, q6venc->rlc_buf_len, DMA_TO_DEVICE);
+		outer_inv_range(__pa((u32) (void *)q6venc->rlc_bufs[i].vaddr),
+				__pa((u32) (void *)(q6venc->rlc_bufs[i].vaddr + q6venc->rlc_buf_len))); 
+	}
+
+	ret = dal_call_f5(q6venc->venc, type, q6_init_config,
+			  sizeof(struct q6_init_config));
+	if (ret) {
+		pr_err("%s: rpc failed \n", __func__);
+		goto err_dal_rpc_init;
+	}
+	mutex_unlock(&q6venc->lock);
+	return 0;
+
+err_dal_rpc_init:
+	q6venc->num_enc_bufs = 0;
+	put_pmem_file(q6venc->rlc_bufs[1].file);
+err_get_rlc_buf2:
+	put_pmem_file(q6venc->rlc_bufs[0].file);
+err_get_rlc_buf1:
+	put_pmem_file(q6venc->enc_bufs[1].file);
+err_get_ref_frame_buf2:
+	put_pmem_file(q6venc->enc_bufs[0].file);
+err_get_ref_frame_buf1:
+err_busy:
+	mutex_unlock(&q6venc->lock);
 	return ret;
 }
 
-static int vdec_release(struct inode *inode, struct file *file)
+static int q6_encode(struct q6venc_dev *q6venc, struct encode_param *enc_param)
 {
+	struct q6_encode_param *q6_param = &enc_param->q6_encode_param;
+	struct file *file;
+	struct buf_info *buf;
+	int i;
 	int ret;
-	struct vdec_msg_list *l, *n;
-	struct vdec_mem_list *m, *k;
-	struct vdec_data *vd = file->private_data;
+	int rlc_buf_index;
 
-	vd->running = 0;
-	wake_up_all(&vd->vdec_msg_evt);
+	pr_debug("y_addr fd=%d offset=0x%08lx uv_offset=0x%08lx\n",
+		 enc_param->y_addr.fd, enc_param->y_addr.offset,
+		 enc_param->uv_offset);
 
-	if (!vd->close_decode)
-		vdec_close(vd, NULL);
-
-	ret = dal_detach(vd->vdec_handle);
-	if (ret)
-		printk(KERN_INFO "%s: failed to detach (%d)\n", __func__, ret);
-
-	list_for_each_entry_safe(l, n, &vd->vdec_msg_list_free, list) {
-		list_del(&l->list);
-		kfree(l);
+	file = fget(enc_param->y_addr.fd);
+	if (!file) {
+		pr_err("%s: invalid encode buffer fd %d\n", __func__,
+		       enc_param->y_addr.fd);
+		return -EBADF;
 	}
 
-	list_for_each_entry_safe(l, n, &vd->vdec_msg_list_head, list) {
-		list_del(&l->list);
-		kfree(l);
+	mutex_lock(&q6venc->lock);
+
+	for (i = 0; i < q6venc->num_enc_bufs; i++) {
+		buf = &q6venc->enc_bufs[i];
+		if (buf->file == file
+		    && buf->venc_buf.offset == enc_param->y_addr.offset)
+			break;
 	}
 
-	list_for_each_entry_safe(m, k, &vd->vdec_mem_list_head, list) {
-		list_del(&m->list);
-		kfree(m);
+	if (i == q6venc->num_enc_bufs) {
+		if (q6venc->num_enc_bufs == VENC_MAX_BUF_NUM) {
+			pr_err("%s: too many input buffers\n", __func__);
+			ret = -ENOMEM;
+			goto done;
+		}
+
+		buf = &q6venc->enc_bufs[q6venc->num_enc_bufs];
+		ret = get_buf_info(buf, &enc_param->y_addr);
+		if (ret) {
+			pr_err("%s: can't get encode buffer\n", __func__);
+			ret = -EINVAL;
+			goto done;
+		}
+
+		if (!IS_ALIGNED(buf->paddr, PAGE_SIZE)) {
+			pr_err("%s: input buffer not 4k aligned\n", __func__);
+			put_buf_info(buf);
+			ret = -EINVAL;
+			goto done;
+		}
+		q6venc->num_enc_bufs++;
 	}
-	mutex_lock(&vdec_ref_lock);
-	BUG_ON(ref_cnt <= 0);
-	ref_cnt--;
-	mutex_unlock(&vdec_ref_lock);
-	kfree(vd);
-	allow_sleep();
-	return 0;
+
+	/* We must invalidate the buffer that the DSP will write to
+	* to ensure that a dirty cache line doesn't get flushed on
+	* top of the data that the DSP is writing.
+	* Unfortunately, we have to predict which rlc_buf index the
+	* DSP is going to write to.  We assume it will write to buf
+	* 0 the first time we call q6_encode, and alternate afterwards
+	* */
+	rlc_buf_index = q6venc->rlc_buf_index;
+
+	dmac_unmap_area((void *)q6venc->rlc_bufs[rlc_buf_index].vaddr, q6venc->rlc_buf_len, DMA_TO_DEVICE);
+	outer_inv_range(__pa((u32) (void *)q6venc->rlc_bufs[rlc_buf_index].vaddr),
+			__pa((u32) (void *)(q6venc->rlc_bufs[rlc_buf_index].vaddr + q6venc->rlc_buf_len))); 
+			
+	q6venc->rlc_buf_index = (q6venc->rlc_buf_index + 1) % RLC_MAX_BUF_NUM;
+
+	q6_param->luma_addr = buf->paddr;
+	q6_param->chroma_addr = q6_param->luma_addr + enc_param->uv_offset;
+	pr_debug("luma_addr=0x%08x chroma_addr=0x%08x\n", q6_param->luma_addr,
+		 q6_param->chroma_addr);
+
+	/* Ideally, each ioctl that passed in a data buffer would include the size
+	* of the input buffer, so we can properly flush the cache on it.  Since
+	* userspace does not fill in the size fields, we have to assume the size
+	* based on the encoder configuration for now.
+	*/
+	flush_pmem_file(buf->file, enc_param->y_addr.offset,
+		q6venc->enc_buf_size);
+
+	ret = dal_call_f5(q6venc->venc, VENC_DALRPC_ENCODE, q6_param,
+			  sizeof(struct q6_encode_param));
+	if (ret) {
+		pr_err("%s: encode rpc failed\n", __func__);
+		goto done;
+	}
+
+	ret = 0;
+
+done:
+	mutex_unlock(&q6venc->lock);
+	fput(file);
+	return ret;
 }
 
-static const struct file_operations vdec_fops = {
-	.owner = THIS_MODULE,
-	.open = vdec_open,
-	.release = vdec_release,
-	.unlocked_ioctl = vdec_ioctl,
+static int q6venc_ioctl(struct inode *inode, struct file *file,
+			unsigned cmd, unsigned long arg)
+{
+	struct q6venc_dev *q6venc = file->private_data;
+	struct init_config config;
+	struct encode_param encode_param;
+	struct intra_refresh intra_refresh;
+	struct rc_config rc_config;
+	struct frame_type frame_done;
+	unsigned int id;
+	unsigned long flags;
+	int err = 0;
+
+	if (!q6venc) {
+		pr_err("%s: file has no private data\n", __func__);
+		return -ENODEV;
+	}
+
+	pr_debug("%s\n", __func__);
+
+	switch (cmd) {
+	case VENC_IOCTL_INITIALIZE:
+		pr_debug("%s: VENC_IOCTL_INITIALIZE\n", __func__);
+		if (copy_from_user(&config, (void __user *)arg, sizeof(config)))
+			return -EFAULT;
+		err = q6_config_encode(q6venc, VENC_DALRPC_INITIALIZE, &config);
+		break;
+
+	case VENC_IOCTL_ENCODE_CONFIG:
+		pr_debug("%s: VENC_IOCTL_ENCODE_CONFIG\n", __func__);
+		if (copy_from_user(&config, (void __user *)arg, sizeof(config)))
+			return -EFAULT;
+
+		err = q6_config_encode(q6venc, VENC_DALRPC_ENCODE_CONFIG,
+				       &config);
+		break;
+
+	case VENC_IOCTL_ENCODE:
+		pr_debug("%s: VENC_IOCTL_ENCODE\n", __func__);
+		if (copy_from_user(&encode_param, (void __user *)arg,
+				   sizeof(encode_param)))
+			return -EFAULT;
+		err = q6_encode(q6venc, &encode_param);
+		break;
+
+	case VENC_IOCTL_INTRA_REFRESH:
+		pr_debug("%s: VENC_IOCTL_INTRA_REFRESH\n", __func__);
+		if (copy_from_user(&intra_refresh, (void __user *)arg,
+				   sizeof(intra_refresh)))
+			return -EFAULT;
+
+		mutex_lock(&q6venc->lock);
+		err = dal_call_f5(q6venc->venc, VENC_DALRPC_INTRA_REFRESH,
+				  &intra_refresh, sizeof(struct intra_refresh));
+		mutex_unlock(&q6venc->lock);
+		if (err)
+			pr_err("%s: intra_refresh rpc failed\n", __func__);
+		break;
+
+	case VENC_IOCTL_RC_CONFIG:
+		pr_debug("%s: VENC_IOCTL_RC_CONFIG\n", __func__);
+		if (copy_from_user(&rc_config, (void __user *)arg,
+				   sizeof(rc_config)))
+			return -EFAULT;
+
+		mutex_lock(&q6venc->lock);
+		err = dal_call_f5(q6venc->venc, VENC_DALRPC_RC_CONFIG,
+				  &rc_config, sizeof(rc_config));
+		mutex_unlock(&q6venc->lock);
+		if (err)
+			pr_err("%s: dal_call_f5 failed\n", __func__);
+		break;
+
+	case VENC_IOCTL_STOP:
+		pr_debug("%s: VENC_IOCTL_STOP\n", __func__);
+
+		mutex_lock(&q6venc->lock);
+		err = dal_call_f0(q6venc->venc, VENC_DALRPC_STOP, 1);
+		if (err)
+			pr_err("%s: dal_rpc STOP call failed\n", __func__);
+
+		/* XXX: if the dal call fails we still want to continue to free
+		 * the buffers. Is this correct? */
+		for (id = 0; id < q6venc->num_enc_bufs; id++)
+			put_buf_info(&q6venc->enc_bufs[id]);
+		put_buf_info(&q6venc->rlc_bufs[0]);
+		put_buf_info(&q6venc->rlc_bufs[1]);
+		q6venc->num_enc_bufs = 0;
+		q6venc->stop_encode = true;
+		mutex_unlock(&q6venc->lock);
+		break;
+
+	case VENC_IOCTL_WAIT_FOR_ENCODE:
+		pr_debug("%s: waiting for encode done event \n", __func__);
+		err = wait_event_interruptible(q6venc->encode_wq,
+				(q6venc->encode_done || q6venc->stop_encode));
+		if (err < 0) {
+			err = -ERESTARTSYS;
+			break;
+		}
+
+		mutex_lock(&q6venc->lock);
+		if (q6venc->stop_encode) {
+			q6venc->stop_encode = false;
+			mutex_unlock(&q6venc->lock);
+			pr_debug("%s: Received Stop encode event \n", __func__);
+			err = -EINTR;
+			break;
+		}
+
+		spin_lock_irqsave(&q6venc->done_lock, flags);
+		if (!q6venc->encode_done) {
+			spin_unlock_irqrestore(&q6venc->done_lock, flags);
+			pr_err("%s: encoding not stopped, and is not done.\n",
+			       __func__);
+			err = -EIO;
+			break;
+		}
+
+		memcpy(&frame_done, &q6venc->done_frame,
+		       sizeof(struct frame_type));
+		q6venc->encode_done = false;
+		spin_unlock_irqrestore(&q6venc->done_lock, flags);
+		mutex_unlock(&q6venc->lock);
+
+		if (frame_done.q6_frame_type.frame_len == 0) {
+			pr_debug("%s: got incorrect address from q6\n",
+				 __func__);
+			err = -EIO;
+			break;
+		}
+
+		pr_debug("%s: done encoding \n", __func__);
+		if (copy_to_user((void __user *)arg, &frame_done,
+				 sizeof(struct frame_type)))
+			err = -EFAULT;
+		break;
+
+	case VENC_IOCTL_STOP_ENCODE:
+		pr_debug("%s: Stop  encode event   \n", __func__);
+		mutex_lock(&q6venc->lock);
+		q6venc->stop_encode = true;
+		wake_up_interruptible(&q6venc->encode_wq);
+		mutex_unlock(&q6venc->lock);
+		break;
+
+	default:
+		err = -ENOTTY;
+		break;
+	}
+
+	return err;
+}
+
+static const struct file_operations q6venc_dev_fops = {
+	.owner		= THIS_MODULE,
+	.open		= q6venc_open,
+	.release	= q6venc_release,
+	.ioctl		= q6venc_ioctl,
 };
 
-static int __init vdec_init(void)
+static struct miscdevice q6venc_misc = {
+	.minor	= MISC_DYNAMIC_MINOR,
+	.name	= "q6venc",
+	.fops	= &q6venc_dev_fops,
+};
+
+static int __init q6venc_init(void)
 {
-	struct device *class_dev;
 	int rc = 0;
 
-	wake_lock_init(&idlelock, WAKE_LOCK_IDLE, "vdec_idle");
-	wake_lock_init(&wakelock, WAKE_LOCK_SUSPEND, "vdec_suspend");
-
-	rc = alloc_chrdev_region(&vdec_device_no, 0, 1, "vdec");
-	if (rc < 0) {
-		pr_err("%s: alloc_chrdev_region failed %d\n", __func__, rc);
-		return rc;
-	}
-
-	driver_class = class_create(THIS_MODULE, "vdec");
-	if (IS_ERR(driver_class)) {
-		rc = -ENOMEM;
-		pr_err("%s: class_create failed %d\n", __func__, rc);
-		goto vdec_init_err_unregister_chrdev_region;
-	}
-	class_dev = device_create(driver_class, NULL,
-				  vdec_device_no, NULL, "vdec");
-	if (!class_dev) {
-		pr_err("%s: class_device_create failed %d\n", __func__, rc);
-		rc = -ENOMEM;
-		goto vdec_init_err_class_destroy;
-	}
-
-	cdev_init(&vdec_cdev, &vdec_fops);
-	vdec_cdev.owner = THIS_MODULE;
-	rc = cdev_add(&vdec_cdev, MKDEV(MAJOR(vdec_device_no), 0), 1);
-
-	if (rc < 0) {
-		pr_err("%s: cdev_add failed %d\n", __func__, rc);
-		goto vdec_init_err_class_device_destroy;
-	}
-
-	return 0;
-
-vdec_init_err_class_device_destroy:
-	device_destroy(driver_class, vdec_device_no);
-vdec_init_err_class_destroy:
-	class_destroy(driver_class);
-vdec_init_err_unregister_chrdev_region:
-	unregister_chrdev_region(vdec_device_no, 1);
+	rc = misc_register(&q6venc_misc);
+	if (rc)
+		pr_err("%s: Unable to register q6venc misc device\n", __func__);
 	return rc;
 }
 
-static void __exit vdec_exit(void)
+static void __exit q6venc_exit(void)
 {
-	device_destroy(driver_class, vdec_device_no);
-	class_destroy(driver_class);
-	unregister_chrdev_region(vdec_device_no, 1);
+	misc_deregister(&q6venc_misc);
 }
 
-MODULE_DESCRIPTION("video decoder driver for QSD platform");
-MODULE_VERSION("2.00");
+MODULE_DESCRIPTION("video encoder driver for QSD platform");
+MODULE_VERSION("2.0");
 
-module_init(vdec_init);
-module_exit(vdec_exit);
+module_init(q6venc_init);
+module_exit(q6venc_exit);
+
