@@ -810,11 +810,11 @@ static struct htc_battery_platform_data htc_battery_pdev_data = {
 	.gpio_mbat_in = -1,
 	.gpio_mchg_en_n = HTCLEO_GPIO_BATTERY_CHARGER_ENABLE,
 	.gpio_iset = HTCLEO_GPIO_BATTERY_CHARGER_CURRENT,
-	// .gpio_power = HTCLEO_GPIO_POWER_USB,
+	.gpio_power = HTCLEO_GPIO_POWER_USB,
 	.guage_driver = GUAGE_DS2746,
 	.charger = LINEAR_CHARGER,
 	.m2a_cable_detect = 0,
-	// .force_no_rpc = 1,
+	.force_no_rpc = 1,
 	.int_data = {
 		.chg_int = HTCLEO_GPIO_BATTERY_OVER_CHG,
 	},
