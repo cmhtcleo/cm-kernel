@@ -158,6 +158,18 @@ __secondary_data:
  * registers.
  */
 __enable_mmu:
+
+#ifdef CONFIG_MACH_HTCLEO
+/*
+MOV  R3, #0xA9000000
+ORR  R3, R3, #0x800
+ORR  R3, R3, #0x00C
+LDR  R1, [R3]
+ORR  R1, R1, #0x20
+STR  R1, [R3]
+*/
+#endif
+
 #ifdef CONFIG_ALIGNMENT_TRAP
 	orr	r0, r0, #CR_A
 #else
@@ -288,7 +300,14 @@ __create_page_tables:
 	.endif
 	str	r6, [r0]
 
-#ifdef CONFIG_DEBUG_LL
+// HTC LEO test code
+	add   r0, r4, #0xf0000000 >> 18
+	orr   r3, r7, #0x20000000
+	str   r3, [r0]
+
+
+//#ifdef CONFIG_DEBUG_LL
+#if 0
 	ldr	r7, [r10, #PROCINFO_IO_MMUFLAGS] @ io_mmuflags
 	/*
 	 * Map in IO space for serial debugging.
@@ -316,6 +335,20 @@ __create_page_tables:
 	orr	r3, r7, #0x7c000000
 	str	r3, [r0]
 #endif
+
+#ifdef CONFIG_MACH_HTCLEO
+	/*
+	*  I small life sign test for HTC Leo 
+	*  We mapping the addresses for the vibration GPIO
+	*/
+#if 0
+	add   r0, r4, #0xff000000 >> 18
+	//  orr   r3, r7, #0xA9000000
+	orr   r3, r7, #0x20000000
+	str   r3, [r0]
+#endif
+#endif
+
 #ifdef CONFIG_ARCH_RPC
 	/*
 	 * Map in screen at 0x02000000 & SCREEN2_BASE

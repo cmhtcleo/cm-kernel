@@ -413,6 +413,8 @@ struct platform_device msm_device_i2c = {
 #define GPIO_I2C_DAT 96
 static int gpio_i2c_clk = -1;
 static int gpio_i2c_dat = -1;
+
+#if !defined(CONFIG_MACH_HTCLEO)
 void msm_set_i2c_mux(bool gpio, int *gpio_clk, int *gpio_dat)
 {
 	unsigned id;
@@ -444,6 +446,39 @@ void msm_set_i2c_mux(bool gpio, int *gpio_clk, int *gpio_dat)
 		msm_proc_comm(PCOM_RPC_GPIO_TLMM_CONFIG_EX, &id, 0);
 	}
 }
+#else
+void msm_set_i2c_mux(bool gpio, int *gpio_clk, int *gpio_dat, int clk_str, int dat_str)
+{
+	unsigned id;
+
+	if (gpio_i2c_clk < 0) {
+		gpio_request(GPIO_I2C_CLK, "i2c-clk");
+		gpio_i2c_clk = GPIO_I2C_CLK;
+	}
+	if (gpio_i2c_dat < 0) {
+		gpio_request(GPIO_I2C_DAT, "i2c-dat");
+		gpio_i2c_dat = GPIO_I2C_DAT;
+	}
+
+	if (gpio) {
+		id = PCOM_GPIO_CFG(GPIO_I2C_CLK, 0, GPIO_OUTPUT,
+				   GPIO_NO_PULL, GPIO_2MA);
+		msm_proc_comm(PCOM_RPC_GPIO_TLMM_CONFIG_EX, &id, 0);
+		id = PCOM_GPIO_CFG(GPIO_I2C_DAT, 0, GPIO_OUTPUT,
+				   GPIO_NO_PULL, GPIO_2MA);
+		msm_proc_comm(PCOM_RPC_GPIO_TLMM_CONFIG_EX, &id, 0);
+		*gpio_clk = GPIO_I2C_CLK;
+		*gpio_dat = GPIO_I2C_DAT;
+	} else {
+		id = PCOM_GPIO_CFG(GPIO_I2C_CLK, 1, GPIO_INPUT,
+				   GPIO_NO_PULL, clk_str);
+		msm_proc_comm(PCOM_RPC_GPIO_TLMM_CONFIG_EX, &id, 0);
+		id = PCOM_GPIO_CFG(GPIO_I2C_DAT , 1, GPIO_INPUT,
+				   GPIO_NO_PULL, clk_str);
+		msm_proc_comm(PCOM_RPC_GPIO_TLMM_CONFIG_EX, &id, 0);
+	}
+}
+#endif
 
 static struct resource resources_hsusb[] = {
 	{
@@ -888,7 +923,11 @@ struct clk msm_clocks_8x50[] = {
 	CLK_PCOM("pbus_clk",	PBUS_CLK,	NULL, CLK_MIN),
 	CLK_PCOM("pcm_clk",	PCM_CLK,	NULL, 0),
 	CLK_PCOM("sdac_clk",	SDAC_CLK,	NULL, OFF),
+#if defined(CONFIG_MACH_HTCLEO)
+	CLK_PCOM("spi_clk",	SPI_CLK,	&NULL, 0),
+#else
 	CLK_PCOM("spi_clk",	SPI_CLK,	&msm_device_spi.dev, 0),
+#endif
 	CLK_PCOM("sdc_clk",	SDC1_CLK,	&msm_device_sdc1.dev, OFF),
 	CLK_PCOM("sdc_pclk",	SDC1_P_CLK,	&msm_device_sdc1.dev, OFF),
 	CLK_PCOM("sdc_clk",	SDC2_CLK,	&msm_device_sdc2.dev, OFF),
