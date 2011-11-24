@@ -1176,6 +1176,7 @@ static int msmfb_probe(struct platform_device *pdev)
 #endif
 
 #ifdef CONFIG_FB_MSM_LOGO
+	#ifndef CONFIG_MACH_HTCLEO
 	if (!load_565rle_image(INIT_IMAGE_FILE)) {
 		/* Flip buffer */
 		msmfb->update_info.left = 0;
@@ -1185,6 +1186,9 @@ static int msmfb_probe(struct platform_device *pdev)
 		msmfb_pan_update(info, 0, 0, fb->var.xres,
 				 fb->var.yres, 0, 1);
 	}
+	#else
+	if (!load_565rle_image(INIT_IMAGE_FILE));
+	#endif
 #endif
 	/* Jay, 29/12/08' */
 	display_notifier(display_notifier_callback, NOTIFY_MSM_FB);

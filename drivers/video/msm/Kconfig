@@ -60,3 +60,9 @@ config MSM_HDMI
 	depends on MSM_MDP31
 	default n
 
+config FB_MSM_LOGO
+	bool "MSM Frame Buffer Logo"
+	default n
+	---help---
+	  Show /initlogo.rle during boot.
+
