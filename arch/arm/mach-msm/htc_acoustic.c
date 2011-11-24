@@ -85,7 +85,7 @@ static int is_rpc_connect(void)
 	return 1;
 }
 
-int turn_mic_bias_on(int on)
+/*int turn_mic_bias_on(int on)
 {
 	struct mic_bias_req {
 		struct rpc_request_hdr hdr;
@@ -100,6 +100,7 @@ int turn_mic_bias_on(int on)
 			    &req, sizeof(req), 5 * HZ);
 }
 EXPORT_SYMBOL(turn_mic_bias_on);
+*/
 
 static int acoustic_mmap(struct file *file, struct vm_area_struct *vma)
 {
