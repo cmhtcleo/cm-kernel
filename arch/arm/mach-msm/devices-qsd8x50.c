@@ -414,6 +414,7 @@ struct platform_device msm_device_i2c = {
 static int gpio_i2c_clk = -1;
 static int gpio_i2c_dat = -1;
 
+/*
 #if !defined(CONFIG_MACH_HTCLEO)
 void msm_set_i2c_mux(bool gpio, int *gpio_clk, int *gpio_dat)
 {
@@ -447,6 +448,7 @@ void msm_set_i2c_mux(bool gpio, int *gpio_clk, int *gpio_dat)
 	}
 }
 #else
+*/
 void msm_set_i2c_mux(bool gpio, int *gpio_clk, int *gpio_dat, int clk_str, int dat_str)
 {
 	unsigned id;
@@ -478,7 +480,7 @@ void msm_set_i2c_mux(bool gpio, int *gpio_clk, int *gpio_dat, int clk_str, int d
 		msm_proc_comm(PCOM_RPC_GPIO_TLMM_CONFIG_EX, &id, 0);
 	}
 }
-#endif
+//#endif
 
 static struct resource resources_hsusb[] = {
 	{
