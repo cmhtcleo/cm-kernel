@@ -1,13 +1,18 @@
 obj-y += proc_comm.o
 obj-y += io.o irq.o timer.o dma.o memory.o
 obj-y += vreg.o
+obj-$(CONFIG_MACH_HTCLEO) += dex_comm.o
 obj-y += pmic.o
 obj-$(CONFIG_ARCH_MSM_ARM11) += acpuclock-arm11.o idle.o
 obj-$(CONFIG_ARCH_MSM_SCORPION) += idle-v7.o
 obj-$(CONFIG_ARCH_MSM_SCORPION) += arch-init-scorpion.o
 obj-$(CONFIG_ARCH_QSD8X50) += acpuclock-qsd8x50.o
 obj-$(CONFIG_ARCH_MSM7X30) += acpuclock-7x30.o
+
+ifndef CONFIG_MACH_HTCLEO
 obj-y += clock.o clock-pcom.o
+endif
+
 obj-y += gpio.o generic_gpio.o
 obj-y += nand_partitions.o
 obj-y += drv_callback.o
@@ -16,7 +21,15 @@ obj-y += htc_board_tags.o
 obj-$(CONFIG_ARCH_QSD8X50) += sirc.o
 obj-$(CONFIG_MSM_FIQ_SUPPORT) += fiq_glue.o
 obj-$(CONFIG_MSM_SMD) += smd.o smd_debug.o
-obj-$(CONFIG_MSM_SMD) += smd_tty.o smd_qmi.o
+obj-$(CONFIG_MSM_SMD) += smd_tty.o
+
+ifdef CONFIG_MACH_HTCLEO
+obj-$(CONFIG_MSM_SMD) +=  smd_qmi_wince.o
+obj-y += clock-wince.o 
+else
+obj-$(CONFIG_MSM_SMD) +=  smd_qmi.o
+endif
+
 obj-$(CONFIG_MSM_SMD) += last_radio_log.o
 obj-$(CONFIG_MSM_DAL) += dal.o
 obj-$(CONFIG_MSM_ONCRPCROUTER) += smd_rpcrouter.o
@@ -97,6 +110,11 @@ obj-$(CONFIG_MACH_BRAVOC) += board-bravo-microp.o
 obj-$(CONFIG_MACH_BRAVOC) += board-bravo-tpa2018d1.o
 obj-$(CONFIG_MACH_BRAVOC) += board-bravo-smb329.o
 
+obj-$(CONFIG_MACH_HTCLEO) += board-htcleo-audio.o board-htcleo-acoustic.o
+obj-$(CONFIG_MACH_HTCLEO) += board-htcleo.o board-htcleo-panel.o board-htcleo-keypad.o
+obj-$(CONFIG_MACH_HTCLEO) += board-htcleo-ts.o board-htcleo-mmc.o ieee754-df.o
+obj-$(CONFIG_MACH_HTCLEO) += board-htcleo-microp.o
+
 obj-$(CONFIG_HTC_PWRSINK) += htc_pwrsink.o
 obj-$(CONFIG_HTC_PWRSPLY) += htc_power_supply.o
 obj-$(CONFIG_HTC_HEADSET) += htc_headset.o
@@ -111,6 +129,8 @@ obj-$(CONFIG_PERFLOCK) += htc_set_perflock.o
 
 obj-$(CONFIG_MACH_MAHIMAHI) += board-mahimahi-tpa2018d1.o
 obj-$(CONFIG_MACH_MAHIMAHI) += board-mahimahi-smb329.o
+
+obj-$(CONFIG_HTC_FB_CONSOLE) += htc_fb_console.o
 
 obj-$(CONFIG_ARCH_MSM_FLASHLIGHT) += msm_flashlight.o
 
